@@ -240,3 +240,5 @@ chroma/
 
 # Colab results
 results/
+
+provenance_guard.db
