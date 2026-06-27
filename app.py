@@ -2,8 +2,11 @@ import os
 import uuid
 import sqlite3
 import json
+import re
 from datetime import datetime
 from flask import Flask, request, jsonify
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -13,14 +16,20 @@ load_dotenv()
 app = Flask(__name__)
 DB_FILE = "provenance_guard.db"
 
-# Initialize Groq Client
+# Initialize Production Rate Limiter with memory storage URI
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://"
+)
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("CRITICAL: GROQ_API_KEY environment variable is missing.")
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 def init_db():
-    """Initializes the structured SQLite database for logging and lifecycle status."""
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -39,14 +48,9 @@ def init_db():
         """)
         conn.commit()
 
-# Ensure the database layer exists on boot
 init_db()
 
 def get_llm_score(text: str) -> float:
-    """
-    Evaluates semantic properties of text using Groq to estimate P(AI).
-    Returns a float between 0.0 (Pure Human) and 1.0 (Pure AI).
-    """
     try:
         system_prompt = (
             "You are an expert content forensics system specializing in identifying AI-generated text.\n"
@@ -64,25 +68,46 @@ def get_llm_score(text: str) -> float:
                 {"role": "user", "content": f"Analyze this text:\n\n{text}"}
             ],
             response_format={"type": "json_object"},
-            temperature=0.1 # Keep variance low for consistent classification profiles
+            temperature=0.1
         )
 
         raw_content = response.choices[0].message.content
         result_json = json.loads(raw_content)
-        
-        # Guard against key deviations or bad ranges
         score = float(result_json.get("ai_probability", 0.5))
         return max(0.0, min(1.0, score))
     except Exception as e:
         print(f"Error executing Groq API classification: {e}")
-        return 0.5  # Neutral fallback uncertainty score if API is unreachable
+        return 0.5
+
+def calculate_stylometric_score(text: str) -> float:
+    tokens = re.findall(r'\b\w+\b', text.lower())
+    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+    
+    if not tokens or not sentences:
+        return 0.5
+
+    ttr = len(set(tokens)) / len(tokens)
+    sentence_lengths = [len(re.findall(r'\b\w+\b', s)) for s in sentences]
+    num_sentences = len(sentence_lengths)
+    
+    if num_sentences > 1:
+        mean_len = sum(sentence_lengths) / num_sentences
+        variance = sum((x - mean_len) ** 2 for x in sentence_lengths) / num_sentences
+    else:
+        variance = 0.0
+    
+    heur_variance_score = max(0.0, min(1.0, 1.0 - (variance / 50.0)))
+    
+    if 0.45 <= ttr <= 0.70:
+        heur_ttr_score = 0.8
+    else:
+        heur_ttr_score = 0.2
+
+    return (heur_variance_score + heur_ttr_score) / 2.0
 
 @app.route("/submit", methods=["POST"])
+@limiter.limit("10 per minute")
 def submit():
-    """
-    Accepts text submissions and coordinates the multi-signal pipeline.
-    Expects JSON payload with 'text' and 'creator_id'.
-    """
     data = request.get_json() or {}
     text = data.get("text")
     creator_id = data.get("creator_id")
@@ -93,34 +118,69 @@ def submit():
     content_id = str(uuid.uuid4())
     timestamp = datetime.utcnow().isoformat() + "Z"
 
-    # Execute Signal 1: Semantic Evaluation
     llm_score = get_llm_score(text)
+    heur_score = calculate_stylometric_score(text)
+    combined_score = (0.65 * llm_score) + (0.35 * heur_score)
 
-    # For Milestone 3, our aggregate score and classification will temporarily reflect just Signal 1
-    # We will incorporate Signal 2 and your exact thresholds in Milestone 4.
-    temp_attribution = "likely_ai" if llm_score > 0.5 else "likely_human"
-    temp_label = f"Temporary Label — Score: {llm_score:.2f}."
+    # User-facing production labels mapped exactly to spec criteria
+    if combined_score < 0.40:
+        attribution = "likely_human"
+        label = "Verified Human Attribution — This content aligns consistently with human writing patterns and structural variance."
+    elif combined_score <= 0.75:
+        attribution = "uncertain"
+        label = "Attribution Unverifiable — This text contains a mixture of stylistic markers. Content context cannot be definitively automated."
+    else:
+        attribution = "likely_ai"
+        label = "Automated Content Label — Our systems indicate a high probability that this text was generated using an AI model."
 
-    # Commit entry to structured audit log
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO audit_log 
             (content_id, creator_id, timestamp, text_preview, attribution, confidence, llm_score, heur_score, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (content_id, creator_id, timestamp, text[:50], temp_attribution, llm_score, llm_score, 0.0, "classified"))
+        """, (content_id, creator_id, timestamp, text[:50], attribution, combined_score, llm_score, heur_score, "classified"))
         conn.commit()
 
     return jsonify({
         "content_id": content_id,
-        "attribution": temp_attribution,
-        "confidence": round(llm_score, 4),
-        "label": temp_label
+        "attribution": attribution,
+        "confidence": round(combined_score, 4),
+        "label": label
+    }), 200
+
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    data = request.get_json() or {}
+    content_id = data.get("content_id")
+    creator_reasoning = data.get("creator_reasoning")
+
+    if not content_id or not creator_reasoning:
+        return jsonify({"error": "Missing required fields: content_id and creator_reasoning"}), 400
+
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM audit_log WHERE content_id = ?", (content_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            return jsonify({"error": f"Submission context not found for ID: {content_id}"}), 404
+            
+        cursor.execute("""
+            UPDATE audit_log 
+            SET status = 'under_review', appeal_reasoning = ? 
+            WHERE content_id = ?
+        """, (creator_reasoning, content_id))
+        conn.commit()
+
+    return jsonify({
+        "content_id": content_id,
+        "status": "under_review",
+        "message": "Appeal successfully registered. Your content attribution status is currently under internal review."
     }), 200
 
 @app.route("/log", methods=["GET"])
 def get_log():
-    """Returns all recorded attribution decisions for grading and monitoring visibility."""
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
